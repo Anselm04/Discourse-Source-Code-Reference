@@ -1,0 +1,589 @@
+# frozen_string_literal: true
+
+module Jobs
+  class StreamDiscoverReply < ::Jobs::Base
+    sidekiq_options retry: false
+
+    STREAM_INTERVAL = 0.3
+    MAX_QUEUE_DELAY = 2.seconds
+    REQUEST_DEADLINE = 20.seconds
+
+    def execute(args)
+      return execute_legacy(args) if args[:request_id].blank?
+
+      ask_log = AskAiLog.find_by(id: args[:ask_ai_log_id], user_id: args[:user_id]) if args[
+        :ask_ai_log_id
+      ]
+      return if ask_log&.ask_outcome.present?
+
+      return if (user = User.find_by(id: args[:user_id])).nil?
+      return if (query = args[:query]).blank?
+      return if !DiscourseAi::Discoveries.enabled_for_user?(user)
+      return if !DiscourseAi::Discoveries.valid_request_id?(args[:request_id])
+      return if !active_request?(user, args[:request_id])
+
+      ai_agent = configured_agent(user)
+      return if ai_agent.nil?
+
+      llm_model_id = ai_agent.default_llm_id.presence || SiteSetting.ai_default_llm_model
+      return if (llm_model = LlmModel.find_by(id: llm_model_id)).nil?
+      ask_log&.assign_attributes(ai_agent_id: ai_agent.id, llm_id: llm_model.id)
+      feature_context = ask_log ? { ask_ai_log_id: ask_log.id } : {}
+
+      base = { query:, request_id: args[:request_id] }
+      result_settings = request_result_settings(args, user)
+      repeat_answer = repeat_answer_cache(user, args, ai_agent, llm_model, result_settings)
+      if !args[:fresh_answer] && (cached = repeat_answer&.read)
+        return if !active_request?(user, args[:request_id])
+
+        keyword_query = cached[:rewritten] ? cached[:keyword_query] : query
+        semantic_query = cached[:rewritten] ? cached[:semantic_query] : query
+        ask_log&.assign_attributes(
+          keyword_query:,
+          semantic_query:,
+          query_locale: cached[:query_locale],
+          candidate_post_ids: cached[:posts].map(&:first).uniq,
+          time_to_first_answer_ms: ask_log.ms_since_answer_requested,
+        )
+        publish_rewrite(user, base, keyword_query, semantic_query) if cached[:rewritten]
+        publish_answer(user, base, ask_log, ai_agent.id, cached)
+        ask_log&.assign_attributes(cache_hit: true)
+        return
+      end
+
+      queued_at = Float(args[:queued_at], exception: false)
+      if queued_at && Time.now.to_f - queued_at > MAX_QUEUE_DELAY
+        ask_log.ask_outcome = :failed if ask_log
+        publish_unavailable(user, base)
+        return
+      end
+
+      admitted =
+        DiscourseAi::Discoveries.admit_request(user_id: user.id, request_id: args[:request_id])
+      if !admitted
+        ask_log.ask_outcome = :failed if ask_log
+        publish_unavailable(user, base)
+        return
+      end
+
+      deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + REQUEST_DEADLINE
+      cancel_manager = DiscourseAi::Completions::CancelManager.new
+      cancel_manager.start_monitor(delay: 0.2) do
+        !DiscourseAi::Discoveries.active_request?(user.id, args[:request_id]) ||
+          Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+      end
+      publish_update(user, base.merge(done: false, phase: "searching"))
+
+      stage = :rewrite
+      rewritten_queries = rewrite_queries(user:, query:, cancel_manager:, feature_context:)
+      if ask_log
+        ask_log.assign_attributes(
+          keyword_query: rewritten_queries.keyword_query,
+          semantic_query: rewritten_queries.semantic_query,
+          query_locale: rewritten_queries.original_query_locale,
+        )
+        ask_log.failure_stage = :rewrite if rewritten_queries.failed
+      end
+      if cancel_manager.cancelled? || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        return
+      end
+      return if !active_request?(user, args[:request_id])
+
+      rewritten =
+        !rewritten_queries.failed &&
+          (rewritten_queries.keyword_query != query || rewritten_queries.semantic_query != query)
+      if rewritten
+        publish_rewrite(
+          user,
+          base,
+          rewritten_queries.keyword_query,
+          rewritten_queries.semantic_query,
+        )
+      end
+
+      stage = :retrieval
+      retrieval = DiscourseAi::Discoveries::Retrieval.new(user:)
+      retrieval_options = {
+        keyword_query: rewritten_queries.keyword_query,
+        semantic_query: rewritten_queries.semantic_query,
+        locale: rewritten_queries.original_query_locale,
+      }
+      scope_filter = DiscourseAi::Discoveries.scope_filter(args[:scope])
+      retrieval_options[:scope_filter] = scope_filter if scope_filter
+      retrieval_result = retrieval.call(query, **retrieval_options)
+      if cancel_manager.cancelled? || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+        return
+      end
+      return if !active_request?(user, args[:request_id])
+      # passages include the answers added to a candidate, not only its matched post
+      if ask_log
+        ask_log.candidate_post_ids =
+          retrieval_result
+            .synthesis_candidates
+            .flat_map do |candidate|
+              [candidate["post_id"], *Array(candidate["passages"]).pluck("post_id")]
+            end
+            .compact
+            .uniq
+      end
+      base = base.merge(scope_fallback: true) if retrieval_result.scope_fallback
+      if retrieval_result.synthesis_candidates.empty?
+        ask_log&.assign_attributes(ask_outcome: :no_answer, no_answer_reason: :no_candidates)
+        publish_no_answer(user, base)
+        return
+      end
+      candidate_topic_ids = retrieval_result.candidates.pluck("topic_id").compact.uniq
+
+      stage = :synthesis
+      synthesis =
+        DiscourseAi::Discoveries::Synthesis.new(
+          user:,
+          ai_agent:,
+          llm_model:,
+          cancel_manager:,
+          feature_context:,
+        )
+      selected_sources = nil
+      rejected = false
+      discovery_title = ""
+      last_published_answer = ""
+      last_streamed_at = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      reject =
+        lambda do |reason|
+          rejected = true
+          ask_log&.assign_attributes(ask_outcome: :no_answer, no_answer_reason: reason)
+          publish_no_answer(user, base)
+          cancel_manager.cancel!
+        end
+
+      # Models emit the response keys in any order, so the answer streams as
+      # soon as it is meaningful. Once the reply abstains or none of its sources
+      # resolve, anything streamed is retracted and generation stops.
+      result =
+        synthesis.call(
+          query:,
+          candidates: retrieval_result.synthesis_candidates,
+          keyword_query: rewritten_queries.keyword_query,
+          original_query_locale: rewritten_queries.original_query_locale,
+          summary_detail: result_settings[:summary_detail],
+          related_count: result_settings[:related_count],
+        ) do |update|
+          # the cancel monitor already stops this once the request is superseded
+          next if rejected || cancel_manager.cancelled?
+          next reject.call(:abstained) if update[:answerable] == false
+
+          discovery_title = update[:title].to_s.strip if update[:title].present?
+
+          if selected_sources.nil? && update[:source_refs].present?
+            selected_sources =
+              retrieval.sources_for(
+                retrieval_result,
+                update[:source_refs],
+                limit: result_settings[:related_count],
+              )
+            next reject.call(:unresolved_sources) if selected_sources.empty?
+
+            publish_update(
+              user,
+              base.merge(
+                done: false,
+                phase: "sources",
+                ai_discover_title: discovery_title,
+                sources: serialize_sources(selected_sources),
+                candidate_topic_ids:,
+              ),
+            )
+          end
+
+          next if !DiscourseAi::Discoveries::Synthesis.meaningful_answer?(update[:answer])
+          next if update[:answer] == last_published_answer
+
+          now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          if last_published_answer.present? && !Rails.env.test? &&
+               now - last_streamed_at < STREAM_INTERVAL
+            next
+          end
+
+          last_published_answer = update[:answer]
+          last_streamed_at = now
+          publish_update(
+            user,
+            base.merge(
+              done: false,
+              phase: "answering",
+              ai_discover_title: discovery_title,
+              ai_discover_reply: last_published_answer,
+            ),
+          )
+          if ask_log && ask_log.time_to_first_answer_ms.nil?
+            ask_log.time_to_first_answer_ms = ask_log.ms_since_answer_requested
+          end
+        end
+
+      return if rejected
+      if cancel_manager.cancelled? || Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline ||
+           !active_request?(user, args[:request_id])
+        return
+      end
+
+      final_sources =
+        retrieval.sources_for(
+          retrieval_result,
+          result.source_refs,
+          limit: result_settings[:related_count],
+        )
+      answerable =
+        result.answerable && final_sources.present? &&
+          DiscourseAi::Discoveries::Synthesis.meaningful_answer?(result.answer)
+
+      if answerable
+        answer = {
+          answer: result.answer,
+          title: result.title,
+          follow_up: result.follow_up,
+          sources: final_sources,
+          candidate_topic_ids:,
+          scope_fallback: retrieval_result.scope_fallback,
+        }
+        evictions =
+          repeat_answer&.write(
+            **answer,
+            candidates: retrieval_result.synthesis_candidates,
+            rewritten:,
+            keyword_query: rewritten_queries.keyword_query,
+            semantic_query: rewritten_queries.semantic_query,
+            query_locale: rewritten_queries.original_query_locale,
+          )
+        ask_log&.cache_evictions = evictions if evictions&.positive?
+        publish_answer(user, base, ask_log, ai_agent.id, answer)
+      else
+        ask_log&.assign_attributes(
+          ask_outcome: :no_answer,
+          no_answer_reason: no_answer_reason(result, final_sources),
+        )
+        publish_no_answer(user, base)
+      end
+    rescue LlmCreditAllocation::CreditLimitExceeded => e
+      ask_log&.assign_attributes(ask_outcome: :failed, failure_stage: stage)
+      publish_error_update(user, e, base) if request_still_owned?(user, args[:request_id])
+    rescue StandardError => e
+      ask_log&.assign_attributes(ask_outcome: :failed, failure_stage: stage)
+      Rails.logger.error("Discourse AI Discoveries request #{args[:request_id]} failed: #{e.class}")
+      publish_processing_error(user, base) if request_still_owned?(user, args[:request_id]) && base
+    ensure
+      cancel_manager&.stop_monitor
+      if admitted
+        DiscourseAi::Discoveries.release_request(user_id: user.id, request_id: args[:request_id])
+      end
+      if ask_log
+        if ask_log.ask_outcome.nil?
+          if deadline && Process.clock_gettime(Process::CLOCK_MONOTONIC) >= deadline
+            ask_log.assign_attributes(ask_outcome: :failed, failure_stage: stage)
+          else
+            ask_log.ask_outcome = :cancelled
+          end
+        end
+        ask_log.time_to_outcome_ms =
+          ask_log.ms_since_answer_requested if ask_log.ask_outcome_changed?
+        ask_log.save! if ask_log.changed?
+      end
+    end
+
+    def repeat_answer_cache(user, args, agent, llm, settings)
+      return if !args.key?(:requested_scope) || !DiscourseAi::Discoveries.combined_search_for?(user)
+      if agent.tools.present? || agent.subagent_ids.present? || agent.ai_agent_mcp_servers.present?
+        return
+      end
+
+      requested_scope = args[:requested_scope]
+      if DiscourseAi::Discoveries.private_search?(
+           query: args[:query],
+           scope: requested_scope,
+           guardian: Guardian.new(user),
+         )
+        return
+      end
+
+      DiscourseAi::Discoveries::RepeatAnswer.new(
+        user:,
+        query: args[:query],
+        requested_scope:,
+        scope: args[:scope],
+        agent:,
+        llm:,
+        settings:,
+      )
+    end
+
+    def publish_rewrite(user, base, keyword_query, semantic_query)
+      return if keyword_query == base[:query] && semantic_query == base[:query]
+
+      publish_update(
+        user,
+        base.merge(done: false, phase: "rewritten", keyword_query:, semantic_query:),
+      )
+    end
+
+    def publish_answer(user, base, ask_log, agent_id, answer)
+      sources = answer.fetch(:sources)
+      ask_log&.assign_attributes(
+        ask_outcome: :answered,
+        answer_title: answer[:title],
+        answer: answer[:answer],
+        suggested_follow_up: answer[:follow_up],
+        source_post_ids: sources.pluck("post_id").compact,
+      )
+      DiscourseAi::Discoveries.store_result(
+        user_id: user.id,
+        request_id: base[:request_id],
+        query: base[:query],
+        answer: answer[:answer],
+        sources:,
+        agent_id:,
+        follow_up: answer[:follow_up],
+      )
+      payload =
+        base.merge(
+          done: true,
+          phase: "complete",
+          answerable: true,
+          ai_discover_title: answer[:title],
+          ai_discover_reply: answer[:answer],
+          ai_discover_follow_up: answer[:follow_up],
+          sources: serialize_sources(sources),
+          candidate_topic_ids: answer[:candidate_topic_ids],
+        )
+      payload[:scope_fallback] = true if answer[:scope_fallback]
+      payload[:cached_at] = answer[:cached_at] if answer[:cached_at]
+      publish_update(user, payload)
+    end
+
+    def publish_update(user, payload)
+      MessageBus.publish("/discourse-ai/discoveries", payload, user_ids: [user.id])
+    end
+
+    def publish_error_update(user, exception, base)
+      allocation = exception.allocation
+
+      details = {}
+      if allocation
+        details[:reset_time_relative] = allocation.relative_reset_time
+        details[:reset_time_absolute] = allocation.formatted_reset_time
+      end
+
+      payload =
+        base.merge(
+          error: true,
+          error_type: "credit_limit_exceeded",
+          message: I18n.t("discourse_ai.ai_bot.discoveries.errors.credits_unavailable"),
+          details:,
+          ai_discover_reply: "",
+          done: true,
+          phase: "complete",
+        )
+
+      publish_update(user, payload)
+    end
+
+    private
+
+    def execute_legacy(args)
+      return if !SiteSetting.ai_discover_enabled
+      return if (user = User.find_by(id: args[:user_id])).nil?
+      return if (query = args[:query]).blank?
+
+      ai_agent_class =
+        AiAgent
+          .all_agents(enabled_only: false)
+          .find { |agent| agent.id == SiteSetting.ai_discover_agent.to_i }
+      return if ai_agent_class.nil? || !user.in_any_groups?(ai_agent_class.allowed_group_ids.to_a)
+
+      llm_model_id = ai_agent_class.default_llm_id || SiteSetting.ai_default_llm_model
+      return if (llm_model = LlmModel.find_by(id: llm_model_id)).nil?
+
+      bot =
+        DiscourseAi::Agents::Bot.as(
+          Discourse.system_user,
+          agent: ai_agent_class.new,
+          model: llm_model,
+        )
+      streamed_reply = +""
+      last_streamed_at = Time.now
+      base = { query:, model_used: llm_model.display_name }
+      context =
+        DiscourseAi::Agents::BotContext.new(
+          user:,
+          messages: [{ type: :user, content: query }],
+          skip_show_thinking: true,
+          feature_name: "discover",
+        )
+
+      bot.reply(context) do |partial|
+        streamed_reply << partial
+        if Time.now - last_streamed_at > STREAM_INTERVAL || Rails.env.test?
+          publish_update(user, base.merge(done: false, ai_discover_reply: streamed_reply))
+          last_streamed_at = Time.now
+        end
+      end
+
+      publish_update(user, base.merge(done: true, ai_discover_reply: streamed_reply))
+    rescue LlmCreditAllocation::CreditLimitExceeded => e
+      publish_legacy_error_update(user, e)
+    end
+
+    def publish_legacy_error_update(user, exception)
+      details = {}
+      if (allocation = exception.allocation)
+        details[:reset_time_relative] = allocation.relative_reset_time
+        details[:reset_time_absolute] = allocation.formatted_reset_time
+      end
+
+      publish_update(
+        user,
+        {
+          error: true,
+          error_type: "credit_limit_exceeded",
+          message: exception.message,
+          details:,
+          done: true,
+        },
+      )
+    end
+
+    def request_result_settings(args, user)
+      configured_settings = DiscourseAi::Discoveries.result_settings(user)
+      summary_detail = args[:summary_detail].to_s.to_sym
+      if !DiscourseAi::Discoveries::SUMMARY_DETAILS.include?(summary_detail)
+        summary_detail = configured_settings[:summary_detail]
+      end
+      related_count = Integer(args[:related_count], exception: false)
+      if !related_count&.between?(
+           DiscourseAi::Discoveries::MIN_RELATED_DISCUSSIONS,
+           DiscourseAi::Discoveries::MAX_RELATED_DISCUSSIONS,
+         )
+        related_count = configured_settings[:related_count]
+      end
+
+      { summary_detail:, related_count: }
+    end
+
+    def configured_agent(user)
+      agent = AiAgent.find_by_id_from_cache(SiteSetting.ai_ask_ai_agent)
+      agent if agent && user.in_any_groups?(agent.allowed_group_ids.to_a)
+    end
+
+    def no_answer_reason(result, sources)
+      return result.no_answer_reason || :abstained if !result.answerable
+      sources.blank? ? :unresolved_sources : :empty_answer
+    end
+
+    def rewrite_queries(user:, query:, cancel_manager:, feature_context:)
+      fallback =
+        DiscourseAi::Discoveries::QueryRewriter::Result.new(
+          keyword_query: query,
+          semantic_query: query,
+          original_query_locale: user.effective_locale,
+        )
+      return fallback if DiscourseAi::Discoveries.private_message_query?(query)
+      return fallback if DiscourseAi::Discoveries::Retrieval.explicit_filters?(query)
+
+      agent = AiAgent.find_by_id_from_cache(SiteSetting.ai_ask_ai_query_rewriter_agent)
+      return fallback if agent.nil?
+      return fallback if !user.in_any_groups?(agent.allowed_group_ids.to_a)
+
+      llm_model_id = agent.default_llm_id.presence || SiteSetting.ai_default_llm_model
+      return fallback if (llm_model = LlmModel.find_by(id: llm_model_id)).nil?
+
+      DiscourseAi::Discoveries::QueryRewriter.new(
+        user:,
+        ai_agent: agent,
+        llm_model:,
+        cancel_manager:,
+        feature_context:,
+      ).call(query)
+    end
+
+    def active_request?(user, request_id)
+      DiscourseAi::Discoveries.active_request?(user.id, request_id) &&
+        DiscourseAi::Discoveries.enabled_for_user?(user)
+    end
+
+    def request_still_owned?(user, request_id)
+      user && DiscourseAi::Discoveries.active_request?(user.id, request_id)
+    end
+
+    def publish_no_answer(user, base)
+      publish_update(
+        user,
+        base.merge(
+          done: true,
+          phase: "complete",
+          answerable: false,
+          ai_discover_title: "",
+          ai_discover_reply: "",
+          sources: [],
+        ),
+      )
+    end
+
+    def publish_processing_error(user, base)
+      publish_update(
+        user,
+        base.merge(
+          error: true,
+          error_type: "processing_failed",
+          message: I18n.t("discourse_ai.ai_bot.discoveries.errors.processing_failed"),
+          ai_discover_reply: "",
+          done: true,
+          phase: "complete",
+        ),
+      )
+    end
+
+    def publish_unavailable(user, base)
+      publish_update(
+        user,
+        base.merge(
+          error: true,
+          error_type: "temporarily_unavailable",
+          message: I18n.t("discourse_ai.ai_bot.discoveries.errors.temporarily_unavailable"),
+          ai_discover_reply: "",
+          done: true,
+          phase: "complete",
+        ),
+      )
+    end
+
+    def serialize_sources(sources)
+      sources.map do |source|
+        if DiscourseAi::Discoveries::ExternalSource.candidate?(source)
+          next serialize_external_source(source)
+        end
+
+        {
+          title: source["title"],
+          url: source["url"],
+          excerpt: source["excerpt"],
+          category: source["category"].presence,
+          category_id: source["category_id"],
+          topic_replies: source["topic_replies"].to_i,
+          bumped_at: source["topic_bumped_at"],
+          username: source["username"],
+          name: SiteSetting.enable_names? ? source["name"] : nil,
+          avatar_template: source["avatar_template"],
+        }
+      end
+    end
+
+    def serialize_external_source(source)
+      {
+        kind: source["kind"],
+        title: source["title"],
+        url: source["url"],
+        excerpt: source["blurb"],
+        source_name: source["source_name"],
+        published_at: source["published_at"],
+      }
+    end
+  end
+end

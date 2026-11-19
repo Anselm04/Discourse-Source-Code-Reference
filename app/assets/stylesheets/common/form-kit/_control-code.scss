@@ -1,0 +1,8 @@
+.form-kit__control-code {
+  height: 250px;
+  width: 100%;
+
+  .form-kit__field.has-error & {
+    border-color: var(--danger);
+  }
+}

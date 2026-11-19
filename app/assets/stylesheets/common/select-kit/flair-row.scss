@@ -1,0 +1,13 @@
+.select-kit.flair-chooser {
+  .select-kit-header,
+  .flair-row {
+    .avatar-flair {
+      --avatar-flair-size: 18px;
+      margin-right: 5px;
+    }
+
+    span {
+      white-space: nowrap;
+    }
+  }
+}

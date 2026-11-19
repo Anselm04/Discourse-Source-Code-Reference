@@ -1,0 +1,44 @@
+@use "lib/viewport";
+
+.admin-controls.admin-site-settings-filter-controls
+  .controls
+  .admin-site-settings-filter-controls__input {
+  max-width: 300px;
+}
+
+.fk-d-menu-modal.admin-site-settings-category-nav-content {
+  .admin-site-settings-category-nav__list a.active {
+    background: var(--d-selected);
+  }
+}
+
+.admin-filtered-site-settings {
+  padding: 1em;
+}
+
+.admin-theme-site-settings-row {
+  &__setting {
+    .setting-label {
+      margin: 0;
+    }
+
+    .setting-description {
+      color: var(--primary-high);
+      font-size: var(--font-down-1);
+    }
+  }
+
+  @include viewport.from(sm) {
+    &__setting {
+      width: 40%;
+    }
+
+    &__default {
+      width: 10%;
+    }
+
+    &__overridden {
+      width: 50%;
+    }
+  }
+}

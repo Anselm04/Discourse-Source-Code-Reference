@@ -1,0 +1,90 @@
+# frozen_string_literal: true
+
+class PostLocalizationsController < ApplicationController
+  before_action :ensure_logged_in
+
+  def show
+    post_id = params[:id] || params[:post_id]
+    raise ActionController::ParameterMissing.new(:id) if post_id.blank?
+
+    post = find_visible_post!(post_id)
+
+    guardian.ensure_can_localize_post!(post)
+
+    post_localizations = PostLocalization.where(post_id: post.id)
+
+    topic_localizations_by_locale = {}
+    if post.is_first_post?
+      TopicLocalization
+        .where(topic_id: post.topic_id)
+        .each { |tl| topic_localizations_by_locale[tl.locale] = tl }
+    end
+
+    post_localizations.each do |pl|
+      pl.define_singleton_method(:topic_localization) { topic_localizations_by_locale[pl.locale] }
+    end
+
+    render json: {
+             post_localizations:
+               ActiveModel::ArraySerializer.new(
+                 post_localizations,
+                 each_serializer: PostLocalizationSerializer,
+                 root: false,
+               ).as_json,
+           },
+           status: :ok
+  end
+
+  def create_or_update
+    post_id, locale, raw = params.require(%i[post_id locale raw])
+
+    post = find_visible_post!(post_id)
+
+    guardian.ensure_can_localize_post!(post)
+
+    localization = PostLocalization.find_by(post_id: post.id, locale:)
+    if localization
+      PostLocalizationUpdater.update(post:, locale:, raw:, user: current_user)
+      render json: success_json, status: :ok
+    else
+      PostLocalizationCreator.create(post:, locale:, raw:, user: current_user)
+      render json: success_json, status: :created
+    end
+  end
+
+  def update_locale
+    post = find_visible_post!(params.require(:post_id))
+
+    updated_post =
+      PostLocaleUpdater.update(post:, locale: params.fetch(:locale).presence, user: current_user)
+    render json: { locale: updated_post.locale }, status: :ok
+  end
+
+  def destroy
+    post_id, locale = params.require(%i[post_id locale])
+
+    post = find_visible_post!(post_id)
+
+    guardian.ensure_can_localize_post!(post)
+
+    PostLocalizationDestroyer.destroy(post:, locale:, acting_user: current_user)
+    head :no_content
+  end
+
+  private
+
+  def find_visible_post!(post_id)
+    post = Post.find_by(id: post_id)
+    raise Discourse::NotFound unless post
+
+    begin
+      guardian.ensure_can_see!(post)
+    rescue Discourse::InvalidAccess
+      raise if SiteSetting.detailed_404
+
+      raise Discourse::NotFound
+    end
+
+    post
+  end
+end

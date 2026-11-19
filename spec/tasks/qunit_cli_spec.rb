@@ -1,0 +1,325 @@
+# frozen_string_literal: true
+
+describe "bin/qunit" do
+  def run(*args, env: {})
+    out, err, status = Open3.capture3(env, "bin/qunit", "--dry-run", *args, chdir: Rails.root.to_s)
+
+    parsed_args, parsed_env =
+      if parsed_result = out.match(/Executing: (?<args>\[.+?\])\nwith env: (?<env>\{.+?\})/m)
+        [JSON.parse(parsed_result[:args]), JSON.parse(parsed_result[:env])]
+      end
+
+    OpenStruct.new(
+      out: out,
+      err: err,
+      status: status.exitstatus,
+      args: parsed_args,
+      env: parsed_env,
+      launched_server: out.include?("[dry-run] skipping server startup"),
+    )
+  end
+
+  let(:core_test_file) do
+    Dir.glob("#{Rails.root.join("frontend/discourse/tests/integration/**/*-test.js")}").first
+  end
+
+  let(:plugin_directory) { "qunit-cli-spec-#{Process.pid}" }
+  let(:plugin_name) { "qunit-cli-spec-plugin-#{Process.pid}" }
+  let(:other_plugin_name) { "qunit-cli-spec-other-#{Process.pid}" }
+  let(:plugin_test_file) do
+    Rails.root.join("plugins", plugin_directory, "test/javascripts/unit/example-test.js").to_s
+  end
+
+  def create_plugin(directory, name)
+    plugin_path = Rails.root.join("plugins", directory)
+    FileUtils.mkdir_p(plugin_path.join("test/javascripts/unit"))
+    File.write(plugin_path.join("plugin.rb"), "# name: #{name}\n")
+    FileUtils.touch(plugin_path.join("test/javascripts/unit/example-test.js"))
+  end
+
+  before do
+    create_plugin(plugin_directory, plugin_name)
+    create_plugin(other_plugin_name, other_plugin_name)
+  end
+
+  after do
+    FileUtils.rm_rf(Rails.root.join("plugins", plugin_directory))
+    FileUtils.rm_rf(Rails.root.join("plugins", other_plugin_name))
+  end
+
+  def core_test_files_in(dir)
+    Dir.glob(Rails.root.join("frontend/discourse/tests/#{dir}/**/*-test.{js,gjs,ts,gts}")).sort
+  end
+
+  let(:default_watchdog_env) do
+    {
+      "QUNIT_BROWSER_WATCHDOG" => "1",
+      "QUNIT_BROWSER_START_TIMEOUT" => "45",
+      "QUNIT_BROWSER_INACTIVITY_TIMEOUT" => "30",
+    }
+  end
+
+  it "runs all core tests by default" do
+    result = run
+    expect(result.status).to eq(0)
+    expect(result.launched_server).to eq(false)
+
+    expect(result.args).to match(
+      [
+        "pnpm",
+        "ember",
+        "exam",
+        "--query",
+        "target=core&testem=1",
+        "--random",
+        a_string_matching(/\A[a-zA-Z0-9]{8}\z/),
+        "--path",
+        "dist",
+      ],
+    )
+    expect(result.env).to match(
+      default_watchdog_env.merge(
+        "UNICORN_PORT" => a_truthy_value,
+        "TESTEM_DEFAULT_BROWSER" => a_truthy_value,
+        "LOAD_PLUGINS" => "0",
+      ),
+    )
+  end
+
+  it "allows running specific file" do
+    result = run(core_test_file)
+    expect(result.status).to eq(0)
+    expect(result.launched_server).to eq(false)
+
+    expect(result.args).to match(
+      [
+        "pnpm",
+        "ember",
+        "exam",
+        "--query",
+        "target=core&testem=1",
+        "--file-path",
+        core_test_file.sub("#{Rails.root.join("frontend/discourse/tests/")}", ""),
+        "--random",
+        a_string_matching(/\A[a-zA-Z0-9]{8}\z/),
+        "--path",
+        "dist",
+      ],
+    )
+    expect(result.env).to match(
+      default_watchdog_env.merge(
+        "UNICORN_PORT" => a_truthy_value,
+        "TESTEM_DEFAULT_BROWSER" => a_truthy_value,
+        "LOAD_PLUGINS" => "0",
+      ),
+    )
+  end
+
+  it "allows running all plugin tests" do
+    result = run("--target", "plugins")
+    expect(result.status).to eq(0)
+    expect(result.launched_server).to eq(false)
+
+    expect(result.args).to match(
+      [
+        "pnpm",
+        "ember",
+        "exam",
+        "--query",
+        "testem=1",
+        "--random",
+        a_string_matching(/\A[a-zA-Z0-9]{8}\z/),
+        "--path",
+        "dist",
+      ],
+    )
+    expect(result.env).to match(
+      default_watchdog_env.merge(
+        "UNICORN_PORT" => a_truthy_value,
+        "TESTEM_DEFAULT_BROWSER" => a_truthy_value,
+        "LOAD_PLUGINS" => "1",
+        "PLUGIN_TARGETS" => a_string_matching(/,/),
+      ),
+    )
+    expect(result.env["PLUGIN_TARGETS"].split(",")).to include(plugin_name, other_plugin_name)
+  end
+
+  it "allows running tests for multiple plugins" do
+    result = run("--target", "chat,discourse-local-dates")
+    expect(result.status).to eq(0)
+    expect(result.launched_server).to eq(false)
+
+    expect(result.args).to match(
+      [
+        "pnpm",
+        "ember",
+        "exam",
+        "--query",
+        "testem=1",
+        "--random",
+        a_string_matching(/\A[a-zA-Z0-9]{8}\z/),
+        "--path",
+        "dist",
+      ],
+    )
+    expect(result.env).to match(
+      default_watchdog_env.merge(
+        "UNICORN_PORT" => a_truthy_value,
+        "TESTEM_DEFAULT_BROWSER" => a_truthy_value,
+        "LOAD_PLUGINS" => "1",
+        "PLUGIN_TARGETS" => "chat,discourse-local-dates",
+      ),
+    )
+  end
+
+  it "allows running specific plugin test file" do
+    result = run(plugin_test_file)
+    expect(result.status).to eq(0)
+    expect(result.launched_server).to eq(false)
+
+    expect(result.args).to match(
+      [
+        "pnpm",
+        "ember",
+        "exam",
+        "--query",
+        "target=#{plugin_name}&testem=1",
+        "--file-path",
+        "discourse/plugins/#{plugin_name}/unit/example-test.js",
+        "--random",
+        a_string_matching(/\A[a-zA-Z0-9]{8}\z/),
+        "--path",
+        "dist",
+      ],
+    )
+    expect(result.env).to match(
+      default_watchdog_env.merge(
+        "UNICORN_PORT" => a_truthy_value,
+        "TESTEM_DEFAULT_BROWSER" => a_truthy_value,
+        "LOAD_PLUGINS" => "1",
+      ),
+    )
+  end
+
+  it "targets the plugin when given a plugin directory without a trailing slash" do
+    result = run("plugins/#{plugin_directory}")
+    expect(result.status).to eq(0)
+    expect(result.args).to include("target=#{plugin_name}&testem=1")
+    expect(result.env).to include("LOAD_PLUGINS" => "1")
+  end
+
+  it "passes core directories as a path prefix" do
+    result = run("frontend/discourse/tests/integration/components")
+    expect(result.status).to eq(0)
+    expect(result.args).to include("--file-path", "./integration/components/")
+  end
+
+  it "skips the path filter for the core tests root" do
+    result = run("frontend/discourse/tests")
+    expect(result.status).to eq(0)
+    expect(result.args).not_to include("--file-path")
+  end
+
+  it "passes plugin directories as a path prefix" do
+    result = run("plugins/#{plugin_directory}/test/javascripts")
+    expect(result.status).to eq(0)
+    expect(result.args).to include("--file-path", "discourse/plugins/#{plugin_name}/")
+  end
+
+  it "rejects directories outside the test directories" do
+    result = run("frontend/discourse")
+    expect(result.status).to eq(1)
+    expect(result.err).to include("frontend/discourse is not a test directory")
+  end
+
+  it "aborts when a file list is too long for the test page URL" do
+    result = run(*core_test_files_in("acceptance"))
+    expect(result.status).to eq(1)
+    expect(result.err).to include("Too many test files", "Pass directories instead")
+  end
+
+  it "prevents running files from multiple targets" do
+    result = run(core_test_file, plugin_test_file)
+    expect(result.status).to eq(1)
+    expect(result.out).to include(
+      "Error: Cannot mix multiple plugin/core targets when running specific files",
+    )
+  end
+
+  it "launches server when using --standalone" do
+    result = run("--standalone")
+    expect(result.status).to eq(0)
+    expect(result.launched_server).to eq(true)
+  end
+
+  it "enables the browser watchdog with default settings" do
+    result = run
+
+    expect(result.env).to include(
+      "QUNIT_BROWSER_WATCHDOG" => "1",
+      "QUNIT_BROWSER_START_TIMEOUT" => "45",
+      "QUNIT_BROWSER_INACTIVITY_TIMEOUT" => "30",
+    )
+  end
+
+  it "allows browser watchdog settings to be configured through the environment" do
+    result =
+      run(
+        env: {
+          "QUNIT_BROWSER_WATCHDOG" => "0",
+          "QUNIT_BROWSER_START_TIMEOUT" => "60",
+          "QUNIT_BROWSER_INACTIVITY_TIMEOUT" => "40",
+        },
+      )
+
+    expect(result.env).to include(
+      "QUNIT_BROWSER_WATCHDOG" => "0",
+      "QUNIT_BROWSER_START_TIMEOUT" => "60",
+      "QUNIT_BROWSER_INACTIVITY_TIMEOUT" => "40",
+    )
+  end
+
+  it "gives browser watchdog CLI settings precedence over the environment" do
+    result =
+      run(
+        "--browser-watchdog",
+        "--browser-start-timeout",
+        "70",
+        "--browser-inactivity-timeout",
+        "50",
+        env: {
+          "QUNIT_BROWSER_WATCHDOG" => "0",
+          "QUNIT_BROWSER_START_TIMEOUT" => "60",
+          "QUNIT_BROWSER_INACTIVITY_TIMEOUT" => "40",
+        },
+      )
+
+    expect(result.env).to include(
+      "QUNIT_BROWSER_WATCHDOG" => "1",
+      "QUNIT_BROWSER_START_TIMEOUT" => "70",
+      "QUNIT_BROWSER_INACTIVITY_TIMEOUT" => "50",
+    )
+  end
+
+  it "rejects non-positive browser watchdog settings" do
+    result = run("--browser-inactivity-timeout", "0")
+
+    expect(result.status).to eq(1)
+    expect(result.err).to include("--browser-inactivity-timeout must be greater than 0")
+  end
+
+  it "asks for Playwright's Chromium to be installed when it is missing" do
+    Dir.mktmpdir do |dir|
+      _out, err, status =
+        Open3.capture3(
+          { "PLAYWRIGHT_BROWSERS_PATH" => dir },
+          "bin/qunit",
+          core_test_file,
+          chdir: Rails.root.to_s,
+        )
+
+      expect(status.exitstatus).to eq(1)
+      expect(err).to include("Run `pnpm playwright-install`")
+    end
+  end
+end

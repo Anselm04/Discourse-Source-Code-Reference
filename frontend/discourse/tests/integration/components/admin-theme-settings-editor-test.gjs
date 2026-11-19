@@ -1,0 +1,117 @@
+import { click, render, waitFor } from "@ember/test-helpers";
+import { module, test } from "qunit";
+import ThemeSettingsEditor from "discourse/admin/components/theme-settings-editor";
+import { fillInCodeEditor } from "discourse/tests/helpers/code-editor-helper";
+import { setupRenderingTest } from "discourse/tests/helpers/component-test";
+
+module("Integration | Component | AdminThemeSettingsEditor", function (hooks) {
+  setupRenderingTest(hooks);
+
+  test("renders the model as JSON in the editor", async function (assert) {
+    const model = {
+      model: {
+        settings: [
+          { setting: "setting1", value: "value1" },
+          { setting: "setting2", value: "value2" },
+        ],
+      },
+    };
+
+    await render(<template><ThemeSettingsEditor @model={{model}} /></template>);
+
+    await waitFor(".cm-content");
+
+    assert.dom(".cm-line").hasText("[");
+  });
+
+  test("input is valid json", async function (assert) {
+    const model = [];
+
+    await render(<template><ThemeSettingsEditor @model={{model}} /></template>);
+
+    await fillInCodeEditor(".code-editor", "foo");
+    await click("button#save");
+
+    assert.dom(".validation-error").hasText(/Syntax Error/);
+  });
+
+  test("'setting' key is present for each setting", async function (assert) {
+    const model = [];
+
+    await render(<template><ThemeSettingsEditor @model={{model}} /></template>);
+
+    await fillInCodeEditor(".code-editor", `[{ "value": "value1" }]`);
+    await click("button#save");
+
+    assert.dom(".validation-error").hasText(/Syntax Error/);
+  });
+
+  test("'value' key is present for each setting", async function (assert) {
+    const model = [];
+
+    await render(<template><ThemeSettingsEditor @model={{model}} /></template>);
+
+    await fillInCodeEditor(".code-editor", `[{ "setting": "setting1" }]`);
+    await click("button#save");
+
+    assert.dom(".validation-error").hasText(/Syntax Error/);
+  });
+
+  test("only 'setting' and 'value' keys are present, no others", async function (assert) {
+    const model = [];
+
+    await render(<template><ThemeSettingsEditor @model={{model}} /></template>);
+
+    await fillInCodeEditor(".code-editor", `[{ "other_key": "other-key-1" }]`);
+    await click("button#save");
+
+    assert.dom(".validation-error").hasText(/Syntax Error/);
+  });
+
+  test("no settings are deleted", async function (assert) {
+    const model = {
+      model: {
+        settings: [{ setting: "foo", value: "foo" }],
+      },
+    };
+
+    await render(<template><ThemeSettingsEditor @model={{model}} /></template>);
+
+    await fillInCodeEditor(
+      ".code-editor",
+      JSON.stringify([{ setting: "bar", value: "bar" }])
+    );
+    await click("button#save");
+
+    assert
+      .dom(".validation-error")
+      .hasText(
+        "foo: These settings were deleted. Please restore them and try again."
+      );
+  });
+
+  test("no settings are added", async function (assert) {
+    const model = {
+      model: {
+        settings: [{ setting: "bar", value: "bar" }],
+      },
+    };
+
+    await render(<template><ThemeSettingsEditor @model={{model}} /></template>);
+
+    await fillInCodeEditor(
+      ".code-editor",
+      JSON.stringify([
+        { setting: "foo", value: "foo" },
+        { setting: "bar", value: "bar" },
+      ])
+    );
+    await click("button#save");
+
+    assert
+      .dom(".validation-error")
+      .hasText(
+        "foo: These settings were added. Please remove them and try again."
+      );
+  });
+});

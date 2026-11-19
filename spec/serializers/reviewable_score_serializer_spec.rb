@@ -1,0 +1,281 @@
+# frozen_string_literal: true
+
+RSpec.describe ReviewableScoreSerializer do
+  fab!(:reviewable, :reviewable_flagged_post)
+  fab!(:admin)
+
+  shared_examples "a configured reviewable score reason" do |reason:|
+    describe "#reason" do
+      it "links to its site setting" do
+        serialized = serialized_score(reason)
+        setting_name = described_class::REASONS_AND_SETTINGS[reason.to_sym]
+        link_url =
+          "#{Discourse.base_url}/admin/site_settings/category/all_results?filter=#{setting_name}"
+        link = "<a href=\"#{link_url}\">#{setting_name.gsub("_", " ")}</a>"
+
+        expect(serialized.reason).to include(link)
+      end
+    end
+
+    describe "#reason_type" do
+      it "returns the reason type" do
+        serialized = serialized_score(reason)
+        expect(serialized.reason_type).to eq(reason)
+      end
+    end
+
+    describe "#reason_data" do
+      it "returns no reason data" do
+        serialized = serialized_score(reason)
+        expect(serialized.reason_data).to be_nil
+      end
+    end
+  end
+
+  context "with the post_count reason" do
+    include_examples "a configured reviewable score reason", reason: "post_count"
+  end
+
+  context "with the trust_level reason" do
+    include_examples "a configured reviewable score reason", reason: "trust_level"
+  end
+
+  context "with the new_topics_unless_trust_level reason" do
+    include_examples "a configured reviewable score reason", reason: "new_topics_unless_trust_level"
+  end
+
+  context "with the fast_typer reason" do
+    include_examples "a configured reviewable score reason", reason: "fast_typer"
+  end
+
+  context "with the auto_silence_regex reason" do
+    include_examples "a configured reviewable score reason", reason: "auto_silence_regex"
+  end
+
+  context "with the staged reason" do
+    include_examples "a configured reviewable score reason", reason: "staged"
+  end
+
+  context "with the must_approve_users reason" do
+    include_examples "a configured reviewable score reason", reason: "must_approve_users"
+  end
+
+  context "with the invite_only reason" do
+    include_examples "a configured reviewable score reason", reason: "invite_only"
+  end
+
+  context "with the email_spam reason" do
+    include_examples "a configured reviewable score reason", reason: "email_spam"
+  end
+
+  context "with the suspect_user reason" do
+    include_examples "a configured reviewable score reason", reason: "suspect_user"
+  end
+
+  context "with the contains_media reason" do
+    include_examples "a configured reviewable score reason", reason: "contains_media"
+  end
+
+  describe "#reason" do
+    context "with regular links" do
+      it "adds a link for watched words" do
+        serialized = serialized_score("watched_word")
+        link_url = "#{Discourse.base_url}/admin/customize/watched_words"
+        watched_words_link =
+          "<a href=\"#{link_url}\">#{I18n.t("reviewables.reasons.links.watched_word")}</a>"
+
+        expect(serialized.reason).to include(watched_words_link)
+      end
+
+      it "adds a link for category settings" do
+        category = Fabricate(:category, name: "Reviewable Category", slug: "reviewable-category")
+        reviewable.category = category
+        serialized = serialized_score("category")
+        link_url = "#{Discourse.base_url}/c/#{category.slug}/edit/settings"
+        category_link =
+          "<a href=\"#{link_url}\">#{I18n.t("reviewables.reasons.links.category")}</a>"
+
+        expect(serialized.reason).to include(category_link)
+      end
+    end
+
+    context "with a fast_typer reason" do
+      it "includes the recorded typing duration" do
+        reviewable = Fabricate(:reviewable_queued_post, payload: { "typing_duration_msecs" => 500 })
+        score = ReviewableScore.new(reviewable:, reason: "fast_typer")
+        serialized = described_class.new(score, scope: Guardian.new(admin), root: nil)
+
+        expect(serialized.reason).to include("(0.5 seconds)")
+      end
+
+      it "drops trailing decimals when the duration is a whole number of seconds" do
+        reviewable =
+          Fabricate(:reviewable_queued_post, payload: { "typing_duration_msecs" => 3000 })
+        score = ReviewableScore.new(reviewable:, reason: "fast_typer")
+        serialized = described_class.new(score, scope: Guardian.new(admin), root: nil)
+
+        expect(serialized.reason).to include("(3 seconds)")
+      end
+
+      it "falls back to a message without a typing duration when none was recorded" do
+        serialized = serialized_score("fast_typer")
+
+        expect(serialized.reason).to include("typed their first post suspiciously fast,")
+        expect(serialized.reason).not_to include("second")
+      end
+    end
+
+    context "with custom reasons" do
+      it "serializes it without doing any translation" do
+        custom = "completely custom flag reason"
+        serialized = serialized_score(custom)
+
+        expect(serialized.reason).to match_html("<p>#{custom}</p>")
+      end
+
+      it "cooks and sanitizes basic Markdown without post-specific transformations" do
+        custom = <<~MARKDOWN
+          **Details**
+
+          - first
+          - second
+
+          first<br>second
+
+          @#{admin.username} :smile:
+
+          <script>alert("unsafe")</script>
+        MARKDOWN
+
+        serialized = serialized_score(custom)
+
+        expect(serialized.reason).to match_html(<<~HTML)
+          <p><strong>Details</strong></p>
+          <ul>
+            <li>first</li>
+            <li>second</li>
+          </ul>
+          <p>first<br>second</p>
+          <p>@#{admin.username} :smile:</p>
+        HTML
+      end
+    end
+
+    context "with watched words" do
+      let(:link) do
+        "<a href=\"#{Discourse.base_url}/admin/customize/watched_words\">#{I18n.t("reviewables.reasons.links.watched_word")}</a>"
+      end
+
+      it "tries to guess the watched words if they weren't recorded at the time of flagging" do
+        raw = "I'm a post with some bad words like 'bad' and 'words'."
+        reviewable.target = Fabricate(:post, raw:)
+
+        score = serialized_score("watched_word")
+
+        Fabricate(:watched_word, action: WatchedWord.actions[:flag], word: "bad")
+        Fabricate(:watched_word, action: WatchedWord.actions[:flag], word: "words")
+
+        expect(score.reason).to include("bad, words")
+
+        expect(reviewable.target.raw).to eq(raw)
+      end
+
+      it "handles guessing the watched words when the post hasn't been created yet" do
+        queued_reviewable = Fabricate(:reviewable_queued_post_topic)
+        raw = queued_reviewable.payload["raw"].clone
+        reviewable_score =
+          ReviewableScore.new(reviewable: queued_reviewable, reason: "watched_word")
+
+        Fabricate(:watched_word, action: WatchedWord.actions[:flag], word: "contents")
+        Fabricate(:watched_word, action: WatchedWord.actions[:flag], word: "title")
+
+        result = described_class.new(reviewable_score, scope: Guardian.new(admin), root: nil)
+        expect(result.reason).to include("contents, title")
+        expect(queued_reviewable.payload["raw"]).to eq(raw)
+      end
+
+      it "renders matched words containing HTML and Markdown syntax literally" do
+        words = [
+          "<notifications@example.discoursemail.com>",
+          "[urgent](https://example.com)",
+          "**spam**",
+        ]
+        score =
+          ReviewableScore.new(
+            reviewable: reviewable,
+            reason: "watched_word",
+            context: words.join(","),
+          )
+        serialized = described_class.new(score, scope: admin.guardian, root: nil)
+        reason =
+          I18n.t(
+            "reviewables.reasons.watched_word",
+            link: link,
+            words: CGI.escapeHTML(words.join(", ")),
+            count: words.length,
+          )
+
+        expect(serialized.reason).to match_html("<p>#{reason}</p>")
+      end
+
+      it "uses the no-context message if the post has no watched words" do
+        reviewable.target = Fabricate(:post, raw: "This post contains no bad words.")
+
+        score = serialized_score("watched_word")
+
+        Fabricate(:watched_word, action: WatchedWord.actions[:flag], word: "superbad")
+
+        reason =
+          I18n.t("reviewables.reasons.no_context.watched_word", link:, default: "watched_word")
+
+        expect(score.reason).to match_html("<p>#{reason}</p>")
+      end
+    end
+  end
+
+  describe "#reason_type" do
+    it "returns the watched word reason type" do
+      serialized = serialized_score("watched_word")
+      expect(serialized.reason_type).to eq("watched_word")
+    end
+  end
+
+  describe "#reason_data" do
+    it "returns the watched words found for the watched_word reason" do
+      raw = "I'm a post with some bad words like 'bad' and 'words'."
+      reviewable.target = Fabricate(:post, raw:)
+
+      score = serialized_score("watched_word")
+
+      Fabricate(:watched_word, action: WatchedWord.actions[:flag], word: "bad")
+      Fabricate(:watched_word, action: WatchedWord.actions[:flag], word: "words")
+
+      expect(score.reason_data).to include("bad", "words")
+    end
+  end
+
+  describe "#setting_name_for_reason" do
+    after { DiscoursePluginRegistry.reset_register!(:reviewable_score_links) }
+
+    describe "when a plugin adds a setting name to linkify" do
+      it "gets the setting name from the registry" do
+        reason = :plugin_reason
+        setting_name = "max_username_length"
+        DiscoursePluginRegistry.register_reviewable_score_link(
+          { reason: reason, setting: setting_name },
+          Plugin::Instance.new,
+        )
+
+        score = serialized_score(reason)
+
+        expect(score.setting_name_for_reason(reason)).to eq(setting_name)
+      end
+    end
+  end
+
+  def serialized_score(reason)
+    score = ReviewableScore.new(reviewable: reviewable, reason: reason)
+
+    described_class.new(score, scope: Guardian.new(admin), root: nil)
+  end
+end

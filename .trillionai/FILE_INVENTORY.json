@@ -1,0 +1,40 @@
+{
+  "upstream": "https://github.com/discourse/discourse",
+  "upstream_commit": "f66aeea8081a93da94b65f9988458a71408dfed5",
+  "upstream_tree": "e0ce41e8ab9bf03d41e1d3b940abad733b74b3fc",
+  "upstream_tracked_entries": 28297,
+  "upstream_blob_files": 28297,
+  "expected_source_files": 28274,
+  "verified_source_files": 28274,
+  "excluded_paths": {
+    ".github/workflows/backport.yml": "upstream workflow disabled",
+    ".github/workflows/bundle-analysis-comment.yml": "upstream workflow disabled",
+    ".github/workflows/bundle-analysis.yml": "upstream workflow disabled",
+    ".github/workflows/check-pr-body.yml": "upstream workflow disabled",
+    ".github/workflows/dependabot-bundler-checksums.yml": "upstream workflow disabled",
+    ".github/workflows/dependabot-fontawesome-sprites.yml": "upstream workflow disabled",
+    ".github/workflows/dependabot-pnpm-dedupe.yml": "upstream workflow disabled",
+    ".github/workflows/dependency-submission.yml": "upstream workflow disabled",
+    ".github/workflows/developer-docs-lint.yml": "upstream workflow disabled",
+    ".github/workflows/developer-docs-publish.yml": "upstream workflow disabled",
+    ".github/workflows/labeler.yml": "upstream workflow disabled",
+    ".github/workflows/licenses.yml": "upstream workflow disabled",
+    ".github/workflows/linting.yml": "upstream workflow disabled",
+    ".github/workflows/migration-tests.yml": "upstream workflow disabled",
+    ".github/workflows/publish-assets.yml": "upstream workflow disabled",
+    ".github/workflows/publish-types.yml": "upstream workflow disabled",
+    ".github/workflows/release-branch-handler.yml": "upstream workflow disabled",
+    ".github/workflows/release-handler.yml": "upstream workflow disabled",
+    ".github/workflows/release-notes.yml": "upstream workflow disabled",
+    ".github/workflows/release-prepare-latest-bump.yml": "upstream workflow disabled",
+    ".github/workflows/stale-pr-closer.yml": "upstream workflow disabled",
+    ".github/workflows/tests.yml": "upstream workflow disabled",
+    ".github/workflows/upcoming-change-status-bump.yml": "upstream workflow disabled"
+  },
+  "missing_paths": [],
+  "mismatched_paths": [],
+  "extra_paths": [
+    ".github/workflows/import-reference.yml"
+  ],
+  "scope": "Tracked Git blobs; no external LFS payloads, submodule contents or full history."
+}

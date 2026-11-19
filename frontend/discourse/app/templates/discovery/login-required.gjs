@@ -1,0 +1,71 @@
+import { trustHTML } from "@ember/template";
+import InvitationGate from "discourse/components/invitation-gate";
+import PluginOutlet from "discourse/components/plugin-outlet";
+import bodyClass from "discourse/helpers/body-class";
+import hideApplicationHeaderButtons from "discourse/helpers/hide-application-header-buttons";
+import hideApplicationSidebar from "discourse/helpers/hide-application-sidebar";
+import lazyHash from "discourse/helpers/lazy-hash";
+import routeAction from "discourse/helpers/route-action";
+import DButton from "discourse/ui-kit/d-button";
+
+export default <template>
+  <PluginOutlet @name="login-required">
+    {{hideApplicationHeaderButtons "search" "login" "signup" "menu"}}
+    {{hideApplicationSidebar}}
+    {{bodyClass "login-page"}}
+    {{bodyClass "static-login"}}
+
+    <section class="container">
+      <div class="contents clearfix body-page">
+        <div class="login-welcome">
+          <PluginOutlet
+            @name="above-login"
+            @outletArgs={{lazyHash model=@controller.model}}
+          />
+          <PluginOutlet @name="above-static" />
+
+          <div class="login-content">
+            {{#if @controller.login.showInvitationGate}}
+              <InvitationGate
+                @externalLogin={{@controller.login.externalLogin}}
+              />
+            {{else}}
+              {{trustHTML @controller.model.html}}
+            {{/if}}
+          </div>
+
+          <PluginOutlet @name="below-static" />
+          <PluginOutlet
+            @name="below-login"
+            @outletArgs={{lazyHash model=@controller.model}}
+          />
+
+          {{#unless @controller.login.showInvitationGate}}
+            <div class="body-page-button-container">
+              {{#if @controller.application.canSignUp}}
+                <DButton
+                  class="btn-primary sign-up-button"
+                  @action={{routeAction "showCreateAccount"}}
+                  @label="sign_up"
+                />
+              {{/if}}
+
+              <DButton
+                class="btn-primary login-button"
+                @action={{routeAction "showLogin"}}
+                @icon="user"
+                @label="log_in"
+              />
+            </div>
+
+          {{/unless}}
+
+          <PluginOutlet
+            @name="below-login-buttons"
+            @outletArgs={{lazyHash model=@controller.model}}
+          />
+        </div>
+      </div>
+    </section>
+  </PluginOutlet>
+</template>

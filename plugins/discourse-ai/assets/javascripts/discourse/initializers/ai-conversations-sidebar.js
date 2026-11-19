@@ -1,0 +1,119 @@
+import { findRoute, routeWithin } from "discourse/lib/mobile-tab-bar";
+import { withPluginApi } from "discourse/lib/plugin-api";
+import { i18n } from "discourse-i18n";
+import AiBotSidebarNewConversation from "../components/ai-bot-sidebar-new-conversation.gjs";
+import { AI_CONVERSATIONS_PANEL } from "../services/ai-conversations-sidebar-manager.js";
+
+const NEW_CONVERSATION_ROUTE = "discourse-ai-bot-conversations";
+
+// Matches the rule the sidebar uses to treat a topic as an AI conversation
+function isOwnBotConversation(routeInfo, currentUser) {
+  const topic = findRoute(routeInfo, "topic")?.attributes;
+
+  return (
+    topic?.archetype === "private_message" &&
+    topic.user_id === currentUser?.id &&
+    !!topic.is_bot_pm
+  );
+}
+
+export default {
+  name: "ai-conversations-sidebar",
+
+  initialize() {
+    withPluginApi((api) => {
+      const currentUser = api.container.lookup("service:current-user");
+      const site = api.container.lookup("service:site");
+      if (!currentUser && !site.ai_bot_anonymous_preview) {
+        return;
+      }
+
+      const aiConversationsSidebarManager = api.container.lookup(
+        "service:ai-conversations-sidebar-manager"
+      );
+      aiConversationsSidebarManager.api = api;
+
+      const startNewConversation = () => {
+        const appEvents = api.container.lookup("service:app-events");
+        const router = api.container.lookup("service:router");
+        appEvents.trigger("discourse-ai:new-conversation-btn-clicked");
+
+        // The page focuses its input when it loads
+        if (router.currentRouteName === NEW_CONVERSATION_ROUTE) {
+          document.getElementById("ai-bot-conversations-input")?.focus();
+        } else {
+          router.transitionTo(NEW_CONVERSATION_ROUTE);
+        }
+      };
+
+      api.addSidebarPanel(
+        (BaseCustomSidebarPanel) =>
+          class AiConversationsSidebarPanel extends BaseCustomSidebarPanel {
+            key = AI_CONVERSATIONS_PANEL;
+            hidden = true;
+            displayHeader = false; // this would add a misplaced back to forum button
+            expandActiveSection = true;
+
+            get mobileTab() {
+              const hasBot = currentUser?.ai_enabled_chat_bots?.some(
+                (bot) => !bot.is_agent || bot.has_default_llm
+              );
+
+              if (!hasBot) {
+                return null;
+              }
+
+              return {
+                label: i18n("discourse_ai.ai_bot.conversations.tab_label"),
+                icon: "discobot",
+                url: "/discourse-ai/ai-bot/conversations",
+                primary: true,
+                ownsRoute: (routeInfo) =>
+                  routeInfo.name === "discourse-ai-bot-conversations" ||
+                  isOwnBotConversation(routeInfo, currentUser),
+                isNestedRoute: (routeInfo) => routeWithin(routeInfo, "topic"),
+                createActions: [
+                  {
+                    label: i18n(
+                      "discourse_ai.ai_bot.conversations.new_conversation"
+                    ),
+                    icon: "discobot",
+                    action: startNewConversation,
+                  },
+                ],
+              };
+            }
+          }
+      );
+
+      api.renderInOutlet(
+        "before-sidebar-sections",
+        AiBotSidebarNewConversation
+      );
+
+      const setSidebarPanel = (transition) => {
+        if (transition?.to?.name === "discourse-ai-bot-conversations") {
+          return aiConversationsSidebarManager.forceCustomSidebar();
+        }
+
+        const topic = api.container.lookup("controller:topic").model;
+        // if the topic is not a private message, not created by the current user,
+        // or doesn't have a bot response, we don't need to override sidebar
+        if (
+          currentUser &&
+          topic?.archetype === "private_message" &&
+          topic.user_id === currentUser.id &&
+          topic.is_bot_pm
+        ) {
+          return aiConversationsSidebarManager.forceCustomSidebar();
+        }
+
+        aiConversationsSidebarManager.stopForcingCustomSidebar();
+      };
+
+      api.container
+        .lookup("service:router")
+        .on("routeDidChange", setSidebarPanel);
+    });
+  },
+};

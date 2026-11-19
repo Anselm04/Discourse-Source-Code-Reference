@@ -1,0 +1,108 @@
+import { inject as controller } from "@ember/controller";
+import { action, computed, set } from "@ember/object";
+import { service } from "@ember/service";
+import UserTopicsList from "discourse/controllers/user-topics-list";
+import BulkSelectHelper from "discourse/lib/bulk-select-helper";
+import discourseDebounce from "discourse/lib/debounce";
+import { INPUT_DELAY } from "discourse/lib/environment";
+import {
+  assignedListQueryParams,
+  assignedListRequestParams,
+} from "../../../lib/assigned-list-query-params.js";
+
+export default class GroupAssignedShow extends UserTopicsList {
+  @service taskActions;
+  @service router;
+  @controller user;
+
+  queryParams = [
+    "order",
+    "ascending",
+    "search",
+    ...Object.keys(assignedListQueryParams()),
+  ];
+  order = "";
+  ascending = false;
+  search = "";
+  bulkSelectEnabled = false;
+
+  bulkSelectHelper = new BulkSelectHelper(this);
+
+  selected = [];
+
+  @computed("currentUser.staff")
+  get canBulkSelect() {
+    return this.currentUser?.staff;
+  }
+
+  set canBulkSelect(value) {
+    set(this, "currentUser.staff", value);
+  }
+
+  @computed("search", "model.topics.length")
+  get hasAssignments() {
+    return this.search || !!this.model?.topics?.length;
+  }
+
+  refreshModel() {
+    this.set("loading", true);
+
+    const params = assignedListRequestParams(this, {
+      order: this.order,
+      ascending: this.ascending,
+      search: this.search,
+      direct: this.model.params.direct,
+    });
+
+    return this.store
+      .findFiltered("topicList", { filter: this.model.filter, params })
+      .then((result) => this.set("model", result))
+      .finally(() => {
+        this.set("loading", false);
+      });
+  }
+
+  @action
+  async unassign(targetId, targetType = "Topic") {
+    await this.taskActions.unassign(targetId, targetType);
+    this.router.refresh();
+  }
+
+  @action
+  reassign(topic) {
+    this.taskActions.showAssignModal(topic, {
+      onSuccess: () => this.router.refresh(),
+    });
+  }
+
+  @action
+  changeSort(sortBy) {
+    if (sortBy === this.order) {
+      this.toggleProperty("ascending");
+      this.refreshModel();
+    } else {
+      this.setProperties({ order: sortBy, ascending: false });
+      this.refreshModel();
+    }
+  }
+
+  @action
+  onChangeFilter(value) {
+    discourseDebounce(this, this._setSearchTerm, value, INPUT_DELAY * 2);
+  }
+
+  @action
+  toggleBulkSelect() {
+    this.toggleProperty("bulkSelectEnabled");
+  }
+
+  @action
+  refresh() {
+    this.refreshModel();
+  }
+
+  _setSearchTerm(searchTerm) {
+    this.set("search", searchTerm);
+    this.refreshModel();
+  }
+}

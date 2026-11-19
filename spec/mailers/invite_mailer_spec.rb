@@ -1,0 +1,274 @@
+# frozen_string_literal: true
+
+RSpec.describe InviteMailer do
+  describe "send_invite" do
+    it "omits inaccessible personal message content from default and custom invitations" do
+      [nil, "Please join our forum"].each do |custom_message|
+        inviter = Fabricate(:user)
+        topic =
+          Fabricate(:private_message_topic, user: inviter, excerpt: "Personal message excerpt")
+        invite = Fabricate(:invite, invited_by: inviter, custom_message: custom_message)
+        invite.topics << topic
+
+        message = InviteMailer.send_invite(invite, invite_to_topic: true)
+        expect(message.subject).to include(topic.title)
+        expect(message.body.decoded).to include(topic.excerpt)
+
+        topic.topic_allowed_users.where(user: inviter).destroy_all
+
+        message = InviteMailer.send_invite(invite.reload, invite_to_topic: true)
+        expect(message.subject).not_to include(topic.title)
+        expect(message.body.decoded).not_to include(topic.title, topic.excerpt)
+        expect(message.body.decoded).to include(invite.invite_key)
+        expect(message.body.decoded).to include(custom_message) if custom_message
+      end
+    end
+
+    context "when inviting to site" do
+      context "with default invite message" do
+        fab!(:invite)
+        let(:invite_mail) { InviteMailer.send_invite(invite) }
+
+        it "renders the invitee email" do
+          expect(invite_mail.to).to eql([invite.email])
+        end
+
+        it "renders the subject" do
+          expect(invite_mail.subject).to be_present
+        end
+
+        it "renders site domain name in subject" do
+          expect(invite_mail.subject).to match(Discourse.current_hostname)
+        end
+
+        it "renders the body" do
+          expect(invite_mail.body).to be_present
+        end
+
+        it "renders the inviter email" do
+          expect(invite_mail.from).to eql([SiteSetting.notification_email])
+        end
+
+        it "renders invite link" do
+          expect(invite_mail.body.encoded).to match(
+            "#{Discourse.base_url}/invites/#{invite.invite_key}",
+          )
+        end
+
+        it "omits the email token when invite acceptance uses a code" do
+          SiteSetting.enable_local_logins_via_code = true
+
+          expect(invite_mail.body.encoded).to include(
+            "#{Discourse.base_url}/invites/#{invite.invite_key}",
+          )
+          expect(invite_mail.body.encoded).not_to include(invite.email_token)
+        end
+
+        it "includes the email token when enable_local_logins is disabled after enabling codes" do
+          SiteSetting.enable_local_logins_via_code = true
+          SiteSetting.public_send("enable_local_logins=", false)
+
+          expect(invite_mail.body.encoded).to include(invite.email_token)
+        end
+
+        it "includes the email token when enable_local_logins_via_email is disabled after enabling codes" do
+          SiteSetting.enable_local_logins_via_code = true
+          SiteSetting.public_send("enable_local_logins_via_email=", false)
+
+          expect(invite_mail.body.encoded).to include(invite.email_token)
+        end
+
+        it "includes the email token when DiscourseConnect is enabled" do
+          SiteSetting.enable_local_logins_via_code = true
+          SiteSetting.discourse_connect_url = "https://example.com/sso"
+          SiteSetting.discourse_connect_secret = "x" * 10
+          SiteSetting.enable_discourse_connect = true
+
+          expect(invite_mail.body.encoded).to include(invite.email_token)
+        end
+
+        it "includes the email token when invite acceptance uses a password" do
+          SiteSetting.enable_local_logins_via_code = false
+
+          expect(invite_mail.body.encoded).to include(invite.email_token)
+        end
+      end
+
+      context "with custom invite message" do
+        fab!(:invite) do
+          Fabricate(:invite, custom_message: "Hey, you <b>should</b> join this forum!\n\nWelcome!")
+        end
+
+        context "when custom message includes invite link" do
+          let(:custom_invite_mail) { InviteMailer.send_invite(invite) }
+
+          it "renders the invitee email" do
+            expect(custom_invite_mail.to).to eql([invite.email])
+          end
+
+          it "renders the subject" do
+            expect(custom_invite_mail.subject).to be_present
+          end
+
+          it "renders site domain name in subject" do
+            expect(custom_invite_mail.subject).to match(Discourse.current_hostname)
+          end
+
+          it "renders the body" do
+            expect(custom_invite_mail.body).to be_present
+          end
+
+          it "renders custom_message, stripping HTML" do
+            expect(custom_invite_mail.body.encoded).to match(
+              "Hey, you should join this forum! Welcome!",
+            )
+          end
+
+          it "renders the inviter email" do
+            expect(custom_invite_mail.from).to eql([SiteSetting.notification_email])
+          end
+
+          it "renders invite link" do
+            expect(custom_invite_mail.body.encoded).to match(
+              "#{Discourse.base_url}/invites/#{invite.invite_key}",
+            )
+          end
+        end
+      end
+
+      context "with template modifier" do
+        fab!(:invite)
+        let(:plugin) { Plugin::Instance.new }
+        let(:custom_template) { "plugin_custom_invite_template" }
+
+        before do
+          I18n.backend.store_translations(
+            :en,
+            {
+              plugin_custom_invite_template: {
+                subject_template: "[%{site_name}] Custom Invite from %{inviter_name}",
+                text_body_template:
+                  "Custom invite body: %{invite_link}\n\nFrom: %{inviter_name}\nSite: %{site_domain_name}",
+              },
+            },
+          )
+        end
+
+        after { I18n.backend.reload! }
+
+        it "allows plugins to customize the invite template" do
+          plugin_instance = Plugin::Instance.new
+          @modifier_block = Proc.new { |template, passed_invite| custom_template }
+
+          DiscoursePluginRegistry.register_modifier(
+            plugin_instance,
+            :invite_forum_mailer_template,
+            &@modifier_block
+          )
+
+          mail = InviteMailer.send_invite(invite)
+          expect(mail.subject).to eq(
+            I18n.t(
+              "#{custom_template}.subject_template",
+              site_name: "Discourse",
+              inviter_name: "#{invite.invited_by.name} (#{invite.invited_by.username})",
+            ),
+          )
+          DiscoursePluginRegistry.unregister_modifier(
+            plugin_instance,
+            :invite_forum_mailer_template,
+            &@modifier_block
+          )
+        end
+      end
+    end
+
+    context "when inviting to topic" do
+      fab!(:trust_level_2)
+      let(:topic) do
+        Fabricate(
+          :topic,
+          excerpt: "Topic invite support is now available in Discourse!",
+          user: trust_level_2,
+        )
+      end
+
+      context "with default invite message" do
+        let(:invite) do
+          topic.invite(topic.user, "name@example.com")
+          Invite.find_by(invited_by_id: topic.user.id)
+        end
+
+        let(:invite_mail) { InviteMailer.send_invite(invite, invite_to_topic: true) }
+
+        it "renders the invitee email" do
+          expect(invite_mail.to).to eql(["name@example.com"])
+        end
+
+        it "renders the subject" do
+          expect(invite_mail.subject).to be_present
+        end
+
+        it "renders topic title in subject" do
+          expect(invite_mail.subject).to match(topic.title)
+        end
+
+        it "renders site domain name in subject" do
+          expect(invite_mail.subject).to match(Discourse.current_hostname)
+        end
+
+        it "renders the body" do
+          expect(invite_mail.body).to be_present
+        end
+
+        it "renders the inviter email" do
+          expect(invite_mail.from).to eql([SiteSetting.notification_email])
+        end
+
+        it "renders invite link" do
+          expect(invite_mail.body.encoded).to match(
+            "#{Discourse.base_url}/invites/#{invite.invite_key}",
+          )
+        end
+
+        it "renders topic title" do
+          expect(invite_mail.body.encoded).to match(topic.title)
+        end
+
+        it "respects the private_email setting" do
+          SiteSetting.private_email = true
+
+          message = invite_mail
+          expect(message.body.to_s).not_to include(topic.title)
+          expect(message.body.to_s).not_to include(topic.slug)
+        end
+      end
+
+      context "with custom invite message" do
+        let(:invite) do
+          topic.invite(
+            topic.user,
+            "name@example.com",
+            nil,
+            "Hey, I thought you might enjoy this topic!",
+          )
+
+          Invite.find_by(invited_by_id: topic.user.id)
+        end
+        let(:custom_invite_mail) { InviteMailer.send_invite(invite) }
+
+        it "renders custom_message" do
+          expect(custom_invite_mail.body.encoded).to match(
+            "Hey, I thought you might enjoy this topic!",
+          )
+        end
+
+        it "renders invite link" do
+          expect(custom_invite_mail.body.encoded).to match(
+            "#{Discourse.base_url}/invites/#{invite.invite_key}",
+          )
+        end
+      end
+    end
+  end
+end

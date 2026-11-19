@@ -1,0 +1,3 @@
+Upstream: https://github.com/discourse/discourse
+Revision: f66aeea8081a93da94b65f9988458a71408dfed5
+Original tree: e0ce41e8ab9bf03d41e1d3b940abad733b74b3fc

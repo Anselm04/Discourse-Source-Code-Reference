@@ -1,0 +1,234 @@
+import { click, find, settled, visit } from "@ember/test-helpers";
+import { test } from "qunit";
+import {
+  acceptance,
+  loggedInUser,
+  publishToMessageBus,
+} from "discourse/tests/helpers/qunit-helpers";
+
+acceptance("Discourse Workflows | User modal", function (needs) {
+  // Present only when a published workflow uses a modal node; gates the
+  // subscription and provides the channel's starting message-bus id.
+  needs.user({ discourse_workflows_user_modal_last_id: 0 });
+
+  let lastRequestBody = null;
+  let lastDismissalBody = null;
+
+  needs.pretender((server, helper) => {
+    server.post("/discourse-workflows/modal-responses", (request) => {
+      lastRequestBody = request.requestBody;
+      return helper.response({});
+    });
+    server.post("/discourse-workflows/modal-dismissals", (request) => {
+      lastDismissalBody = request.requestBody;
+      return helper.response({});
+    });
+  });
+
+  needs.hooks.beforeEach(() => {
+    lastRequestBody = null;
+    lastDismissalBody = null;
+  });
+
+  function channel() {
+    return `/discourse-workflows/user-modal/${loggedInUser().id}`;
+  }
+
+  const payload = {
+    type: "show_modal",
+    modal_id: "abcd1234abcd1234",
+    title: "Approve topic?",
+    body: "Please choose an option",
+    buttons: [
+      {
+        label: "Approve",
+        value: "approve",
+        style: "primary",
+        action_id: "1:approve:sig-approve",
+      },
+      {
+        label: "Reject",
+        value: "reject",
+        style: "danger",
+        action_id: "1:reject:sig-reject",
+      },
+    ],
+  };
+
+  test("opens a modal with the configured title, body, and buttons", async function (assert) {
+    await visit("/");
+    await publishToMessageBus(channel(), payload);
+    await settled();
+
+    assert.dom(".workflows-user-modal").exists("the modal opens");
+    assert.dom(".d-modal__title-text").hasText("Approve topic?");
+    assert
+      .dom(".workflows-user-modal__body")
+      .hasText("Please choose an option");
+    assert
+      .dom(".d-modal__footer .btn")
+      .exists({ count: 2 }, "renders one button per configured option");
+    assert.dom(".d-modal__footer .btn-primary").hasText("Approve");
+    assert.dom(".d-modal__footer .btn-danger").hasText("Reject");
+  });
+
+  test("shows the Markdown image and multiline text together", async function (assert) {
+    const text = "first line\n    <b>second line</b>\n\nlast line";
+    await visit("/");
+    await publishToMessageBus(channel(), {
+      ...payload,
+      body: null,
+      buttons: [],
+      cooked_body: `<p><img src="/images/discourse-logo-sketch.png" alt="Original screenshot"></p><pre><code>first line\n    &lt;b&gt;second line&lt;/b&gt;\n\nlast line</code></pre>`,
+    });
+    await settled();
+
+    assert
+      .dom(".workflows-user-modal__markdown img")
+      .hasAttribute(
+        "alt",
+        "Original screenshot",
+        "the original image is in the dialog"
+      );
+    const preview = find(".workflows-user-modal__markdown pre code");
+    assert.strictEqual(
+      preview.innerText,
+      text,
+      "line breaks and indentation are visible"
+    );
+    assert
+      .dom("b", preview)
+      .doesNotExist("markup in the code block stays literal");
+    assert
+      .dom(".workflows-user-modal .d-modal__footer")
+      .doesNotExist("an informational modal has no empty footer");
+  });
+
+  test("posts the chosen button's action id and closes the modal", async function (assert) {
+    await visit("/");
+    await publishToMessageBus(channel(), payload);
+    await settled();
+
+    await click(".d-modal__footer .btn-primary");
+
+    const requestParams = new URLSearchParams(lastRequestBody);
+    assert.strictEqual(
+      requestParams.get("action_id"),
+      "1:approve:sig-approve",
+      "submits the action id of the clicked button"
+    );
+    assert.strictEqual(
+      requestParams.get("modal_id"),
+      "abcd1234abcd1234",
+      "submits the id of the modal instance"
+    );
+    assert.dom(".workflows-user-modal").doesNotExist("the modal closes");
+    assert.strictEqual(
+      lastDismissalBody,
+      null,
+      "responding does not also post a dismissal"
+    );
+  });
+
+  test("closes the modal when it is handled in another tab", async function (assert) {
+    await visit("/");
+    await publishToMessageBus(channel(), payload);
+    await settled();
+    assert.dom(".workflows-user-modal").exists("the modal opens");
+
+    await publishToMessageBus(channel(), {
+      type: "close_modal",
+      modal_id: payload.modal_id,
+    });
+    await settled();
+
+    assert
+      .dom(".workflows-user-modal")
+      .doesNotExist("the modal closes without user interaction");
+  });
+
+  test("never shows a modal whose close arrives in the same poll batch", async function (assert) {
+    await visit("/");
+
+    // No await between the two publishes: both message bus callbacks run in
+    // the same runloop, like a reconnecting tab replaying missed messages.
+    const show = publishToMessageBus(channel(), payload);
+    const close = publishToMessageBus(channel(), {
+      type: "close_modal",
+      modal_id: payload.modal_id,
+    });
+    await show;
+    await close;
+    await settled();
+
+    assert
+      .dom(".workflows-user-modal")
+      .doesNotExist("the batched close cancels the pending show");
+  });
+
+  test("ignores close_modal messages for other modal instances", async function (assert) {
+    await visit("/");
+    await publishToMessageBus(channel(), payload);
+    await settled();
+
+    await publishToMessageBus(channel(), {
+      type: "close_modal",
+      modal_id: "another-modal-id",
+    });
+    await settled();
+
+    assert.dom(".workflows-user-modal").exists("the modal stays open");
+  });
+
+  test("propagates a manual close to the user's other tabs", async function (assert) {
+    await visit("/");
+    await publishToMessageBus(channel(), payload);
+    await settled();
+
+    await click(".workflows-user-modal .modal-close");
+
+    assert.dom(".workflows-user-modal").doesNotExist("the modal closes");
+    assert.strictEqual(
+      new URLSearchParams(lastDismissalBody).get("modal_id"),
+      "abcd1234abcd1234",
+      "posts a dismissal for the modal instance"
+    );
+    assert.strictEqual(
+      lastRequestBody,
+      null,
+      "dismissing does not submit a button response"
+    );
+  });
+
+  test("ignores message bus payloads of other types", async function (assert) {
+    await visit("/");
+    await publishToMessageBus(channel(), { type: "something_else" });
+    await settled();
+
+    assert.dom(".workflows-user-modal").doesNotExist("no modal is opened");
+  });
+});
+
+acceptance(
+  "Discourse Workflows | User modal (feature unused)",
+  function (needs) {
+    // No `discourse_workflows_user_modal_last_id` on the user: no published
+    // workflow uses a modal node, so the initializer must not subscribe.
+    needs.user();
+
+    test("does not subscribe when no workflow uses a modal node", async function (assert) {
+      await visit("/");
+      await publishToMessageBus(
+        `/discourse-workflows/user-modal/${loggedInUser().id}`,
+        {
+          type: "show_modal",
+          title: "Should not appear",
+          buttons: [],
+        }
+      );
+      await settled();
+
+      assert.dom(".workflows-user-modal").doesNotExist("no modal is opened");
+    });
+  }
+);
